@@ -1,0 +1,137 @@
+/**
+ * Dedupe two Google Sheets by a shared key column (default: "profileLink").
+ *
+ * SETUP
+ * 1. Go to https://script.google.com > New project, and paste this whole file in
+ *    (replacing the default Code.gs content).
+ * 2. Fill in the CONFIG block below: paste in the two sheet URLs (or bare IDs)
+ *    and the tab name each one keeps its data on.
+ * 3. In the toolbar, select the `dedupeSheets` function and click Run.
+ *    The first run will prompt you to authorize the script's access to
+ *    Google Sheets - approve it (this is your own script, running as you).
+ * 4. A brand-new spreadsheet named OUTPUT_TITLE will be created containing
+ *    the merged, deduped result. Its URL is shown in the Execution log
+ *    at the bottom of the editor and returned by the function.
+ *
+ * HOW IT DEDUPES
+ * Every row from both sheets is keyed by its value in KEY_COLUMN, after
+ * normalizing it with normalizeKey_() so that formatting variants of the
+ * same link count as one person. Normalizing:
+ *   - trims whitespace and lowercases
+ *   - drops the http:// or https:// prefix and a leading "www."
+ *   - drops ?query and #fragment endings (LinkedIn URLs only, so links that
+ *     carry the profile ID in the query, e.g. facebook.com/profile.php?id=123,
+ *     stay distinct)
+ *   - drops trailing slashes
+ * So "https://www.linkedin.com/in/Jane/?trk=abc" and "linkedin.com/in/jane"
+ * match. The normalized key is used only for matching: the output keeps each
+ * row's original, un-normalized link. Rows with a blank key are skipped.
+ *
+ * - A key seen in only one sheet keeps all of that sheet's columns, and
+ *   `source` is set to "A only" / "B only".
+ * - A key seen in both sheets is merged into a single row: any column
+ *   that's blank in one sheet is filled in from the other (so enrichment
+ *   columns that only exist in one source still make it into the merged
+ *   row), and `source` is set to "Both". Where both sheets have a value
+ *   that differs, sheet A's value is kept.
+ * - Repeat keys within the same sheet are merged the same way, with the
+ *   first row winning.
+ * The output's columns are the union of both sheets' headers (sheet A's
+ * order first, then any columns unique to sheet B), plus a trailing
+ * `source` column.
+ */
+
+const CONFIG = {
+  SHEET_A_ID: '1v1gOhn_266QT1htfIDzYIKSKXYihEniucdYMEt1JOIc',
+  SHEET_A_TAB: 'Sheet1',      // tab/sheet name to read from in A
+  SHEET_B_ID: '1dlolb6Sfy7pMyUaKE4ExHiECflajMqSvH8aU4oUPiL4',
+  SHEET_B_TAB: 'Sheet1',      // tab/sheet name to read from in B
+  KEY_COLUMN: 'profileLink',  // header name used to dedupe
+  OUTPUT_TITLE: 'Deduped Output'
+};
+
+function dedupeSheets() {
+  const idA = extractId_(CONFIG.SHEET_A_ID);
+  const idB = extractId_(CONFIG.SHEET_B_ID);
+
+  const dataA = readSheet_(idA, CONFIG.SHEET_A_TAB);
+  const dataB = readSheet_(idB, CONFIG.SHEET_B_TAB);
+
+  const keyCol = CONFIG.KEY_COLUMN;
+  if (dataA.headers.indexOf(keyCol) === -1) {
+    throw new Error('Key column "' + keyCol + '" not found in sheet A. Headers: ' + dataA.headers.join(', '));
+  }
+  if (dataB.headers.indexOf(keyCol) === -1) {
+    throw new Error('Key column "' + keyCol + '" not found in sheet B. Headers: ' + dataB.headers.join(', '));
+  }
+
+  // Union of all column headers: A's order first, then any B-only columns.
+  const headers = dataA.headers.slice();
+  dataB.headers.forEach(function (h) { if (headers.indexOf(h) === -1) headers.push(h); });
+  headers.push('source');
+
+  const merged = new Map(); // key -> row object keyed by header name
+
+  function ingest(headersForSheet, rows, keyIndex, label) {
+    rows.forEach(function (row) {
+      const key = normalizeKey_(row[keyIndex]);
+      if (!key) return; // skip rows with a blank key
+
+      if (!merged.has(key)) {
+        const obj = {};
+        headers.forEach(function (h) { obj[h] = ''; });
+        headersForSheet.forEach(function (h, i) { obj[h] = row[i]; });
+        obj.source = label;
+        merged.set(key, obj);
+      } else {
+        const obj = merged.get(key);
+        headersForSheet.forEach(function (h, i) {
+          if ((obj[h] === '' || obj[h] === null || obj[h] === undefined) && row[i] !== '') {
+            obj[h] = row[i];
+          }
+        });
+        if (obj.source !== label) obj.source = 'Both';
+      }
+    });
+  }
+
+  ingest(dataA.headers, dataA.rows, dataA.headers.indexOf(keyCol), 'A only');
+  ingest(dataB.headers, dataB.rows, dataB.headers.indexOf(keyCol), 'B only');
+
+  const outRows = [headers];
+  merged.forEach(function (obj) { outRows.push(headers.map(function (h) { return obj[h]; })); });
+
+  const outSs = SpreadsheetApp.create(CONFIG.OUTPUT_TITLE);
+  const outSheet = outSs.getSheets()[0];
+  outSheet.getRange(1, 1, outRows.length, headers.length).setValues(outRows);
+  outSheet.setFrozenRows(1);
+
+  const summary = 'Done: ' + (outRows.length - 1) + ' unique rows written to ' + outSs.getUrl();
+  Logger.log(summary);
+  return outSs.getUrl();
+}
+
+function readSheet_(spreadsheetId, tabName) {
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const sheet = tabName ? ss.getSheetByName(tabName) : ss.getSheets()[0];
+  if (!sheet) throw new Error('Tab "' + tabName + '" not found in spreadsheet ' + spreadsheetId);
+  const values = sheet.getDataRange().getValues();
+  const headers = values[0];
+  const rows = values.slice(1).filter(function (r) { return r.some(function (c) { return c !== ''; }); });
+  return { headers: headers, rows: rows };
+}
+
+// Accepts a full spreadsheet URL or a bare spreadsheet ID.
+function extractId_(urlOrId) {
+  const match = urlOrId.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  return match ? match[1] : urlOrId;
+}
+
+// Normalizes a profile link so formatting variants dedupe together.
+function normalizeKey_(v) {
+  return String(v).trim().toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/[?#].*$/, '')
+    .replace(/\/+$/, '');
+}
